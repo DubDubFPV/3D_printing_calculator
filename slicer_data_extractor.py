@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import json
 
 
@@ -109,6 +109,7 @@ class SlicerExtractionResult:
     raw_text: str = ""
     confidence: float = 0.0  # 0-1 confidence in extraction
     slicer_detected: str = ""  # "IdeaMaker", "BambuStudio", "Unknown"
+    debug_info: Optional["ExtractionDebugInfo"] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for external use - optimized for node workflows"""
@@ -127,6 +128,30 @@ class SlicerExtractionResult:
         return json.dumps(self.to_dict(), indent=2)
 
 
+@dataclass
+class OCRWordBox:
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    conf: float
+
+
+@dataclass
+class OCRPassDebug:
+    variant_label: str
+    config: str
+    text: str
+    word_boxes: List[OCRWordBox] = field(default_factory=list)
+
+
+@dataclass
+class ExtractionDebugInfo:
+    passes: List[OCRPassDebug] = field(default_factory=list)
+    selected_pass_index: int = 0
+
+
 # ============================================================================
 # Main Extractor Class
 # ============================================================================
@@ -143,9 +168,9 @@ class SlicerDataExtractor:
                           e.g., r'C:\\Program Files\\Tesseract-OCR\\tesseract.exe'
         """
         if tesseract_path:
-            pytesseract.pytesseract.pytesseract_cmd = tesseract_path
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
     
-    def extract_from_file(self, image_path: str) -> SlicerExtractionResult:
+    def extract_from_file(self, image_path: str, return_debug: bool = False):
         """
         Extract data from a screenshot file
         
@@ -157,13 +182,13 @@ class SlicerDataExtractor:
         """
         try:
             image = Image.open(image_path)
-            return self.extract_from_image(image)
+            return self.extract_from_image(image, return_debug=return_debug)
         except FileNotFoundError:
             raise FileNotFoundError(f"Image file not found: {image_path}")
         except Exception as e:
             raise RuntimeError(f"Error opening image: {str(e)}")
     
-    def extract_from_image(self, image) -> SlicerExtractionResult:
+    def extract_from_image(self, image, return_debug: bool = False):
         """
         Extract data from a PIL Image
         
@@ -173,32 +198,127 @@ class SlicerDataExtractor:
         Returns:
             SlicerExtractionResult with extracted data
         """
-        # Extract text using OCR
-        raw_text = pytesseract.image_to_string(image)
-        
-        # Detect which slicer this is from
-        slicer_type = self._detect_slicer(raw_text)
-        
-        # Parse time and filament data
-        time_data = self._parse_time(raw_text)
-        filament_data = self._parse_filament(raw_text, slicer_type)
-        filament_length = self._parse_filament_length(raw_text)
-        processing_options = self._parse_processing_options(raw_text)
-        
-        # Calculate confidence
-        confidence = self._calculate_confidence(raw_text, time_data, filament_data)
-        
-        result = SlicerExtractionResult(
-            print_time=time_data,
-            filament=filament_data,
-            filament_length=filament_length,
-            processing_options=processing_options,
-            raw_text=raw_text,
-            confidence=confidence,
-            slicer_detected=slicer_type
+        ocr_passes = self._extract_ocr_passes(image)
+        if not ocr_passes:
+            fallback_text = pytesseract.image_to_string(image)
+            ocr_passes = [OCRPassDebug(variant_label="original", config="default", text=fallback_text, word_boxes=[])]
+
+        best_result: Optional[SlicerExtractionResult] = None
+        best_score = -10**9
+        best_index = 0
+
+        for index, ocr_pass in enumerate(ocr_passes):
+            raw_text = ocr_pass.text
+            slicer_type = self._detect_slicer(raw_text)
+            time_data = self._parse_time(raw_text)
+            filament_data = self._parse_filament(raw_text, slicer_type, time_data)
+            filament_length = self._parse_filament_length(raw_text)
+            processing_options = self._parse_processing_options(raw_text)
+            confidence = self._calculate_confidence(raw_text, time_data, filament_data)
+
+            score = self._score_candidate(raw_text, time_data, filament_data, confidence)
+            result = SlicerExtractionResult(
+                print_time=time_data,
+                filament=filament_data,
+                filament_length=filament_length,
+                processing_options=processing_options,
+                raw_text=raw_text,
+                confidence=confidence,
+                slicer_detected=slicer_type,
+            )
+
+            if best_result is None or score > best_score:
+                best_result = result
+                best_score = score
+                best_index = index
+
+        result = best_result if best_result is not None else SlicerExtractionResult(
+            print_time=TimeData(),
+            filament=FilamentData(),
+            raw_text="",
+            confidence=0.0,
+            slicer_detected="Unknown",
         )
-        
+
+        if return_debug:
+            result.debug_info = ExtractionDebugInfo(passes=ocr_passes, selected_pass_index=best_index)
+            return result
+
         return result
+
+    def _extract_ocr_passes(self, image: Image.Image) -> List[OCRPassDebug]:
+        """Run OCR on the original image only; preprocessing variants hurt box placement."""
+        base = image.convert("RGB")
+        configs = [
+            "--oem 3 --psm 6 -c preserve_interword_spaces=1",
+            "--oem 3 --psm 11 -c preserve_interword_spaces=1",
+        ]
+
+        passes: List[OCRPassDebug] = []
+        for config in configs:
+            variant_label = "original"
+            variant = base
+            try:
+                candidate = pytesseract.image_to_string(variant, config=config)
+            except Exception:
+                continue
+            if not candidate or not candidate.strip():
+                continue
+
+            try:
+                ocr_data = pytesseract.image_to_data(variant, output_type=pytesseract.Output.DICT, config=config)
+                word_boxes: List[OCRWordBox] = []
+                for idx, word in enumerate(ocr_data.get("text", [])):
+                    cleaned = str(word).strip()
+                    if not cleaned:
+                        continue
+                    conf_value = ocr_data.get("conf", [])[idx]
+                    try:
+                        conf = float(conf_value)
+                    except Exception:
+                        conf = -1.0
+                    if conf < 0:
+                        continue
+                    word_boxes.append(
+                        OCRWordBox(
+                            text=cleaned,
+                            left=int(ocr_data.get("left", [0])[idx]),
+                            top=int(ocr_data.get("top", [0])[idx]),
+                            width=int(ocr_data.get("width", [0])[idx]),
+                            height=int(ocr_data.get("height", [0])[idx]),
+                            conf=conf,
+                        )
+                    )
+            except Exception:
+                word_boxes = []
+
+            passes.append(OCRPassDebug(variant_label=variant_label, config=config, text=candidate, word_boxes=word_boxes))
+
+        return passes
+
+
+
+    def _score_candidate(self, raw_text: str, time_data: TimeData, filament_data: FilamentData, confidence: float) -> float:
+        """Heuristic score to pick the best OCR candidate among multiple passes."""
+        text_lower = raw_text.lower()
+        score = confidence * 100.0
+
+        if re.search(r'\btotal\s*time\b', text_lower):
+            score += 25.0
+        if re.search(r'\bmaterial\b|\bfilament\b', text_lower):
+            score += 10.0
+        if re.search(r'(\d+[\.,]\d+)\s*g\b', text_lower):
+            score += 15.0
+
+        # Penalize unlikely giant filament values caused by missed decimal points.
+        if filament_data.amount_grams >= 500:
+            score -= 8.0
+
+        # Prefer candidates where total time likely dominates model printing fragments.
+        if "total time" in text_lower and "model printing time" in text_lower and time_data.total_seconds > 0:
+            score += 8.0
+
+        return score
     
     # ========================================================================
     # Parsing Methods
@@ -228,95 +348,316 @@ class SlicerDataExtractor:
         - "3h41m", "3h50m"
         """
         text_lower = text.lower()
-        hours = 0
-        minutes = 0
-        seconds = 0
-        
-        # Pattern 1: "X hours, Y min, Z sec" (IdeaMaker/BambuStudio exact)
-        pattern1 = r'(\d+)\s*hours?\s*,\s*(\d+)\s*min(?:utes?)?\s*,\s*(\d+)\s*sec(?:onds?)?'
-        match = re.search(pattern1, text_lower)
-        if match:
-            hours = int(match.group(1))
-            minutes = int(match.group(2))
-            seconds = int(match.group(3))
-            return TimeData(hours=hours, minutes=minutes, seconds=seconds)
-        
-        # Pattern 2: "Xh Ym Zs" or "XhYmZs" format
-        pattern2 = r'(\d+)\s*h[\s]*(\d+)\s*m[\s]*(\d+)\s*s'
-        match = re.search(pattern2, text_lower)
-        if match:
-            hours = int(match.group(1))
-            minutes = int(match.group(2))
-            seconds = int(match.group(3))
-            return TimeData(hours=hours, minutes=minutes, seconds=seconds)
-        
-        # Pattern 3: "Xh Ym" or "XhYm" format (no seconds)
-        pattern3 = r'(\d+)\s*h[\s]*(\d+)\s*m(?!\w)'
-        match = re.search(pattern3, text_lower)
-        if match:
-            hours = int(match.group(1))
-            minutes = int(match.group(2))
-            return TimeData(hours=hours, minutes=minutes, seconds=0)
-        
-        # Pattern 4: "X:Y:Z" format (HH:MM:SS)
-        pattern4 = r'(\d+):(\d+):(\d+)'
-        match = re.search(pattern4, text_lower)
-        if match:
-            hours = int(match.group(1))
-            minutes = int(match.group(2))
-            seconds = int(match.group(3))
-            return TimeData(hours=hours, minutes=minutes, seconds=seconds)
-        
-        # Pattern 5: "XmYs" format (minutes and seconds only)
-        pattern5 = r'(\d+)\s*m[\s]*(\d+)\s*s(?!\s*\w)'
-        match = re.search(pattern5, text_lower)
-        if match:
-            minutes = int(match.group(1))
-            seconds = int(match.group(2))
-            return TimeData(hours=0, minutes=minutes, seconds=seconds)
-        
-        # Pattern 6: Days + hours/minutes
-        pattern6 = r'(\d+)\s*d[\s]*(\d+)\s*h[\s]*(\d+)\s*m'
-        match = re.search(pattern6, text_lower)
-        if match:
-            days = int(match.group(1))
-            hours = int(match.group(2))
-            minutes = int(match.group(3))
-            hours += days * 24
-            return TimeData(hours=hours, minutes=minutes, seconds=0)
+        lines = [line.strip() for line in text_lower.splitlines()]
+
+        def parse_time_expression(value: str) -> Optional[TimeData]:
+            value = value.strip().lower()
+            if not value:
+                return None
+
+            # "12 hours, 51 min, 2 sec" and OCR variants without commas
+            match = re.search(r'(\d+)\s*hours?\s*,?\s*(\d+)\s*min(?:utes?)?\s*,?\s*(\d+)\s*sec(?:onds?)?', value)
+            if match:
+                return TimeData(hours=int(match.group(1)), minutes=int(match.group(2)), seconds=int(match.group(3)))
+
+            # "3h41m46s"
+            match = re.search(r'(\d+)\s*h\s*(\d+)\s*m\s*(\d+)\s*s', value)
+            if match:
+                return TimeData(hours=int(match.group(1)), minutes=int(match.group(2)), seconds=int(match.group(3)))
+
+            # "3h41m"
+            match = re.search(r'(\d+)\s*h\s*(\d+)\s*m(?!\w)', value)
+            if match:
+                return TimeData(hours=int(match.group(1)), minutes=int(match.group(2)), seconds=0)
+
+            # "41m46s"
+            match = re.search(r'(\d+)\s*m\s*(\d+)\s*s(?!\w)', value)
+            if match:
+                return TimeData(hours=0, minutes=int(match.group(1)), seconds=int(match.group(2)))
+
+            # HH:MM:SS
+            match = re.search(r'(\d+):(\d+):(\d+)', value)
+            if match:
+                return TimeData(hours=int(match.group(1)), minutes=int(match.group(2)), seconds=int(match.group(3)))
+
+            return None
+
+        def next_time_value(index: int) -> Optional[TimeData]:
+            for next_index in range(index + 1, min(index + 4, len(lines))):
+                candidate = parse_time_expression(lines[next_index])
+                if candidate and candidate.total_seconds > 0:
+                    return candidate
+            return None
+
+        # Hard priority: if we can find "total time" label, use that line or its immediate value line.
+        for i, line in enumerate(lines):
+            if "total" in line and "time" in line:
+                candidate = parse_time_expression(line)
+                if candidate and candidate.total_seconds > 0:
+                    return candidate
+                candidate = next_time_value(i)
+                if candidate:
+                    return candidate
+
+        # Extra BambuStudio heuristic: the "total time" value is often a later line
+        # that OCR may not keep next to the label. If both total and model printing
+        # values appear in the OCR output, prefer the larger one.
+        if any("model printing time" in line for line in lines) and any("total time" in line for line in lines):
+            candidates: List[TimeData] = []
+            for line in lines:
+                if "time" not in line:
+                    continue
+                parsed = parse_time_expression(line)
+                if parsed and parsed.total_seconds > 0:
+                    candidates.append(parsed)
+            if candidates:
+                # Total time should usually be the longest duration on the panel,
+                # but ignore obvious prep/timelapse fragments by the earlier penalty.
+                return max(candidates, key=lambda td: td.total_seconds)
+
+        # Secondary: a "total" label often appears as just "total:" in OCR.
+        for i, line in enumerate(lines):
+            if line.startswith("total") and "cost" not in line and "price" not in line:
+                candidate = parse_time_expression(line)
+                if candidate and candidate.total_seconds > 0:
+                    return candidate
+                candidate = next_time_value(i)
+                if candidate:
+                    return candidate
+
+        def line_score(line: str) -> int:
+            score = 0
+            if "model" in line and "printing" in line and "time" in line:
+                score += 70
+            elif "print" in line and "time" in line:
+                score += 60
+            elif "time" in line:
+                score += 50
+
+            if "prepare" in line or "timelapse" in line:
+                score -= 60
+
+            return score
+
+        best_time: Optional[TimeData] = None
+        best_score = -10**9
+
+        for raw_line in lines:
+            if not raw_line:
+                continue
+
+            parsed = parse_time_expression(raw_line)
+            if not parsed or parsed.total_seconds <= 0:
+                continue
+
+            score = line_score(raw_line)
+            if best_time is None or score > best_score or (score == best_score and parsed.total_seconds > best_time.total_seconds):
+                best_time = parsed
+                best_score = score
+
+        if best_time:
+            return best_time
         
         return TimeData()  # Return empty if no match
     
-    def _parse_filament(self, text: str, slicer_type: str) -> FilamentData:
+    def _parse_filament(self, text: str, slicer_type: str, time_data: Optional[TimeData] = None) -> FilamentData:
         """
         Parse filament weight data from extracted text
         Supports: "100g", "1.5kg", "100 g", "1.5 kg", "377.2 g"
         """
         text_lower = text.lower()
-        
-        # Pattern 1: "XXX.X kg" or "XXX kg"
-        pattern_kg = r'(\d+\.?\d*)\s*kg(?!\w)'
-        match = re.search(pattern_kg, text_lower)
-        if match:
-            amount = float(match.group(1))
-            return FilamentData(amount=amount, unit="kg")
-        
-        # Pattern 2: "XXX.X g" or "XXX g" (but not part of longer words)
-        # Make sure we don't match "kg" or other g-containing words
-        pattern_g = r'(\d+\.?\d*)\s*g(?!\w|ram)'
-        matches = re.finditer(pattern_g, text_lower)
-        
-        # Find the highest value that looks like filament (not likely noise)
-        best_match = None
-        best_amount = 0
-        for match in matches:
-            amount = float(match.group(1))
-            if amount > best_amount and amount < 10000:  # Reasonable filament range
-                best_match = match
-                best_amount = amount
-        
-        if best_match:
-            return FilamentData(amount=best_amount, unit="g")
+        lines = [line.strip() for line in text_lower.splitlines()]
+
+        def parse_decimal(value: str) -> float:
+            return float(value.replace(',', '.'))
+
+        def is_reasonable_grams(value: float) -> bool:
+            return 0 < value < 10000
+
+        def score_grams_candidate(value: float, had_decimal: bool) -> float:
+            score = 0.0
+            if not is_reasonable_grams(value):
+                return -10**6
+
+            if had_decimal:
+                score += 3.0
+            if value <= 500:
+                score += 2.0
+            if value > 500 and not had_decimal:
+                score -= 3.0
+
+            if time_data is not None and time_data.total_seconds > 0:
+                grams_per_hour = value / (time_data.total_seconds / 3600.0)
+                if 0.5 <= grams_per_hour <= 250:
+                    score += 4.0
+                elif 250 < grams_per_hour <= 500:
+                    score += 1.0
+                else:
+                    score -= 4.0
+
+            return score
+
+        def normalized_grams_from_token(token: str) -> Optional[float]:
+            token = token.strip()
+            if not token:
+                return None
+
+            had_decimal = ("." in token) or ("," in token)
+            try:
+                raw_value = parse_decimal(token)
+            except ValueError:
+                return None
+
+            candidates = [raw_value]
+            # OCR sometimes drops decimal points, e.g. "6.44" -> "644".
+            # Only consider these fixes when the implied print rate is plausible.
+            if not had_decimal and raw_value >= 100 and time_data is not None and time_data.total_seconds > 0:
+                candidates.append(raw_value / 10.0)
+                candidates.append(raw_value / 100.0)
+
+            best_value = None
+            best_score = -10**9
+            for candidate in candidates:
+                candidate_score = score_grams_candidate(candidate, had_decimal)
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_value = candidate
+
+            return best_value
+
+        def extract_kg_candidates(value: str) -> List[float]:
+            return [parse_decimal(match) for match in re.findall(r'(\d+[\.,]?\d*)\s*kg\b', value)]
+
+        def extract_g_candidates(value: str) -> List[float]:
+            candidates: List[float] = []
+            for token in re.findall(r'(\d+[\.,]?\d*)\s*g\b', value):
+                try:
+                    # Skip meter-like values (> 100)
+                    raw = parse_decimal(token)
+                    if raw > 100:
+                        continue
+                except ValueError:
+                    pass
+                normalized = normalized_grams_from_token(token)
+                if normalized is not None:
+                    candidates.append(normalized)
+            return candidates
+
+        def rightmost_g_value(value: str) -> Optional[float]:
+            # Only accept explicit "g" tokens; reject meter values (usually > 100).
+            matches = re.findall(r'(\d+[\.,]?\d*)\s*g\b', value)
+            if not matches:
+                return None
+            # Try from rightmost, but skip likely meter values.
+            for token in reversed(matches):
+                try:
+                    candidate = parse_decimal(token)
+                except ValueError:
+                    continue
+                # Skip values that look like meter measurements (> 100 typically)
+                if candidate > 100:
+                    continue
+                return normalized_grams_from_token(token)
+            # If all rightmost values look like meters, try the smallest one.
+            return normalized_grams_from_token(matches[0])
+
+        def extract_rightmost_numeric_token(value: str) -> Optional[float]:
+            tokens = re.findall(r'(\d+[\.,]?\d*)', value)
+            if not tokens:
+                return None
+            try:
+                candidate = parse_decimal(tokens[-1])
+            except ValueError:
+                return None
+            if is_reasonable_grams(candidate):
+                return candidate
+            return None
+
+        def row_matches_total(line: str) -> bool:
+            return "total" in line and "price" not in line and "cost" not in line
+
+        def row_matches_material(line: str) -> bool:
+            return re.search(r'\b(material|filament|model)\b', line) is not None
+
+        # Priority 1: explicit total/material rows from BambuStudio's table.
+        targeted_lines: List[str] = []
+        for line in lines:
+            if not line:
+                continue
+            if (row_matches_total(line) or row_matches_material(line)) and "time" not in line and "price" not in line and "cost" not in line:
+                targeted_lines.append(line)
+
+        # Prefer a real total row if one exists.
+        for line in targeted_lines:
+            if not row_matches_total(line):
+                continue
+            grams = rightmost_g_value(line)
+            if grams is None:
+                grams = extract_rightmost_numeric_token(line)
+            if grams is not None:
+                return FilamentData(amount=grams, unit="g")
+
+        # If the total row was split across OCR lines, look for the best line
+        # with an explicit grams value near the total row.
+        for line in targeted_lines:
+            grams = rightmost_g_value(line)
+            if grams is None:
+                continue
+
+            # Reject suspicious whole-number grams if there are obvious decimals
+            # nearby on the same row, because OCR may have dropped the dot.
+            if grams >= 100 and re.search(r'\d+[\.,]\d+\s*g\b', line):
+                decimals = [parse_decimal(match) for match in re.findall(r'(\d+[\.,]\d*)\s*g\b', line)]
+                if decimals:
+                    grams = max(decimals)
+
+            return FilamentData(amount=grams, unit="g")
+
+        # BambuStudio total-row fallback: if OCR gives a row like "6.65 m 21.11 g",
+        # the grams are usually the rightmost explicit g value on the row.
+        for line in lines:
+            if "total" in line and "g" in line:
+                grams = extract_g_candidates(line)
+                if grams:
+                    return FilamentData(amount=max(grams), unit="g")
+
+        # Priority 2: explicit kg first, then grams globally.
+        kg_candidates = extract_kg_candidates(text_lower)
+        if kg_candidates:
+            return FilamentData(amount=max(kg_candidates), unit="kg")
+
+        g_candidates = extract_g_candidates(text_lower)
+        # Prefer decimal values (5.89 g) over whole numbers, as they're more reliable.
+        decimal_g = [c for c in g_candidates if c != int(c)]
+        if decimal_g:
+            return FilamentData(amount=max(decimal_g), unit="g")
+        # Fall back to whole numbers only if no decimals found.
+        valid_global_g = [candidate for candidate in g_candidates if is_reasonable_grams(candidate)]
+        if valid_global_g:
+            best_global_g = max(valid_global_g)
+            return FilamentData(amount=best_global_g, unit="g")
+
+        # Priority 3: if OCR dropped unit glyph, use rightmost decimal in targeted line.
+        for line in targeted_lines:
+            # Skip lines with meter values (they're length, not weight)
+            if re.search(r'\d+[\.,]?\d*\s*m\b', line):
+                continue
+            numeric_values = [parse_decimal(match) for match in re.findall(r'\d+[\.,]?\d*', line)]
+            if numeric_values:
+                candidate = numeric_values[-1]
+                if is_reasonable_grams(candidate):
+                    return FilamentData(amount=candidate, unit="g")
+
+        # Last resort: if the time context indicates a short job and the OCR
+        # produced a suspiciously large gram value, try the smallest decimal-like
+        # candidate from the total row before giving up.
+        if time_data is not None and time_data.total_seconds > 0:
+            total_like_lines = [line for line in lines if row_matches_total(line)]
+            for line in total_like_lines:
+                decimal_candidates = [parse_decimal(match) for match in re.findall(r'(\d+[\.,]\d+)\s*g\b', line)]
+                if decimal_candidates:
+                    best_decimal = min(decimal_candidates)
+                    return FilamentData(amount=best_decimal, unit="g")
         
         return FilamentData()  # Return empty if no match
     

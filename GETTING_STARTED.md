@@ -60,6 +60,21 @@ print(f"Filament: {data['filament']['amount_grams']}g")
 print(f"Confidence: {data['confidence']}")
 ```
 
+### Step 4: Open the GUI Calculator (optional but recommended)
+
+```bash
+python gui_calculator.py
+```
+
+Or, on Windows, double-click `launch_gui.pyw` to open the GUI without a console window.
+
+Use it to:
+- paste screenshots with `Ctrl+V`
+- view the current session history
+- delete selected screenshots or clear the full list
+- view total print time and total filament used after each paste
+- copy JSON output for another node/code stage
+
 ---
 
 ## How to Use in Your Code

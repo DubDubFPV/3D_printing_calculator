@@ -52,6 +52,23 @@ print(f"Filament: {data['filament']['amount_grams']}g")
 print(f"Options: Travel={data['processing_options']['travel']}")
 ```
 
+### GUI Calculator
+
+Launch the desktop calculator to load screenshots, sum total time, sum total filament, and export JSON:
+
+```bash
+python gui_calculator.py
+```
+
+If you want to start it by double-clicking a file in Windows, open `launch_gui.pyw` instead.
+
+In the GUI you can:
+- paste screenshots directly with `Ctrl+V`
+- add screenshots from files if you prefer the file picker
+- see a live history of jobs created during the current session
+- delete the selected job or clear all jobs from the session
+- copy the full JSON payload for another node or script
+
 ### 3. Test Installation
 
 ```bash
