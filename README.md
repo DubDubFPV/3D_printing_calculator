@@ -35,6 +35,10 @@ pip install pillow pytesseract
 - Download: https://github.com/UB-Mannheim/tesseract/wiki
 - Or: `choco install tesseract`
 
+**Ubuntu/Linux: Install Tesseract OCR**
+- Debian/Ubuntu: `sudo apt install tesseract-ocr`
+- Optional check: `tesseract --version`
+
 ### 2. Basic Usage
 
 ```python
@@ -61,6 +65,7 @@ python gui_calculator.py
 ```
 
 If you want to start it by double-clicking a file in Windows, open `launch_gui.pyw` instead.
+On Linux, run `python3 launch_gui.py` or `python gui_calculator.py` from the project folder.
 
 In the GUI you can:
 - paste screenshots directly with `Ctrl+V`
@@ -246,6 +251,7 @@ extractor = SlicerDataExtractor(
     tesseract_path=r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 )
 ```
+4. On Ubuntu/Linux, install it with `sudo apt install tesseract-ocr` and make sure `tesseract` is on `PATH`.
 
 ### Low confidence extraction
 - Ensure screenshot has good contrast

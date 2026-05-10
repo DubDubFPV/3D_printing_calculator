@@ -35,6 +35,10 @@ pip install pillow pytesseract
 - Option B: Use Chocolatey: `choco install tesseract`
 - Default path: `C:\Program Files\Tesseract-OCR`
 
+**Install Tesseract OCR (Ubuntu/Linux):**
+- Debian/Ubuntu: `sudo apt install tesseract-ocr`
+- Verify: `tesseract --version`
+
 ### Step 2: Verify Installation (5 minutes)
 
 ```bash
@@ -67,6 +71,7 @@ python gui_calculator.py
 ```
 
 Or, on Windows, double-click `launch_gui.pyw` to open the GUI without a console window.
+On Linux, use `python3 launch_gui.py` for the basic calculator, or `python3 gui_calculator.py` if you prefer to run the module directly.
 
 Use it to:
 - paste screenshots with `Ctrl+V`

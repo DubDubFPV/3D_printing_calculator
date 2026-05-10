@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -151,7 +152,7 @@ class SlicerCalculatorApp(tk.Tk):
 
         self.calculator = PrintJobCalculator()
         self.extractor = None
-        self.tesseract_path_var = tk.StringVar(value=r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+        self.tesseract_path_var = tk.StringVar(value=self._default_tesseract_path())
         self.naming_mode_var = tk.StringVar(value="manual")
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.StringVar(value="")
@@ -323,11 +324,19 @@ class SlicerCalculatorApp(tk.Tk):
 
     def _browse_tesseract(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select tesseract.exe",
+            title="Select Tesseract executable",
             filetypes=[("Executable", "tesseract.exe"), ("All files", "*.*")],
         )
         if path:
             self.tesseract_path_var.set(path)
+
+    def _default_tesseract_path(self) -> str:
+        detected = shutil.which("tesseract")
+        if detected:
+            return detected
+        if os.name == "nt":
+            return r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        return ""
 
     def _ensure_extractor(self):
         if self.extractor is not None:
@@ -412,7 +421,16 @@ class SlicerCalculatorApp(tk.Tk):
         if extractor is None:
             return []
 
-        clipboard = ImageGrab.grabclipboard()
+        try:
+            clipboard = ImageGrab.grabclipboard()
+        except Exception as exc:
+            messagebox.showinfo(
+                "Clipboard image unavailable",
+                "Could not read an image from the clipboard on this system.\n\n"
+                "On Linux, clipboard image support may require a desktop clipboard tool or a file-based workflow.\n\n"
+                f"Details: {exc}",
+            )
+            return []
         if clipboard is None:
             messagebox.showinfo("Clipboard empty", "No image was found on the clipboard. Copy a screenshot first, then press Ctrl+V.")
             return []
