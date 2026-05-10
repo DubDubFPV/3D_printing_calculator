@@ -17,8 +17,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from dataclasses import dataclass, asdict, field
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import tkinter as tk
@@ -40,6 +39,7 @@ class JobRecord:
     filament_kilograms: float
     filament_unit: str
     confidence: float
+    time_ambiguous: bool = False
     raw_text: str = ""
     source_image: Optional[Image.Image] = field(default=None, repr=False, compare=False)
     debug_info: Optional[ExtractionDebugInfo] = field(default=None, repr=False, compare=False)
@@ -55,6 +55,7 @@ class JobRecord:
             "filament_kilograms": self.filament_kilograms,
             "filament_unit": self.filament_unit,
             "confidence": self.confidence,
+            "time_ambiguous": self.time_ambiguous,
             "raw_text": self.raw_text,
         }
 
@@ -285,7 +286,7 @@ class SlicerCalculatorApp(tk.Tk):
         self._metric(totals, 0, "Jobs", self.job_count_var)
         self._metric(totals, 1, "Total time", self.total_time_var)
         self._metric(totals, 2, "Total filament", self.total_filament_var)
-        self._metric(totals, 3, "Best confidence", self.confidence_var)
+        self._metric(totals, 3, "Average confidence", self.confidence_var)
 
         self.preview_var = tk.StringVar(value="No screenshot selected")
         preview_frame = ttk.Frame(parent, style="Panel.TFrame")
@@ -482,6 +483,25 @@ class SlicerCalculatorApp(tk.Tk):
                         debug_window.show_record(added_records[-1])
                     except tk.TclError:
                         self.debug_window = None
+            # If extraction looks ambiguous, prompt the user to recapture.
+            for record in added_records:
+                try:
+                    ambiguous = getattr(record, "time_ambiguous", False)
+                    low_conf = float(getattr(record, "confidence", 0.0)) < 0.6
+                except Exception:
+                    ambiguous = False
+                    low_conf = False
+                if ambiguous or low_conf:
+                    name = record.file_path
+                    msg = (
+                        f"Extraction for '{name}' looks ambiguous (confidence {record.confidence:.2f}).\n"
+                        "It may have chosen 'Model printing time' instead of 'Total time', or units may be misread.\n\n"
+                        "Would you like to re-capture the screenshot and try again?"
+                    )
+                    retry = messagebox.askyesno("Ambiguous extraction", msg)
+                    if retry:
+                        messagebox.showinfo("Re-capture", "Please re-capture the slicer screenshot and press Ctrl+V to paste it into the app.")
+                        self.status_var.set("Awaiting recapture and paste (Ctrl+V)...")
             self._refresh_after_change()
             self._set_busy(False)
             if failures:
@@ -502,6 +522,7 @@ class SlicerCalculatorApp(tk.Tk):
             filament_kilograms=float(data["filament"]["amount_kilograms"]),
             filament_unit=str(data["filament"]["unit"]),
             confidence=float(data.get("confidence", 0.0)),
+            time_ambiguous=bool(getattr(result, "time_ambiguous", False)),
             raw_text=str(data.get("raw_text", "")),
         )
 
@@ -567,8 +588,13 @@ class SlicerCalculatorApp(tk.Tk):
         self.total_filament_var.set(totals["total_filament_formatted"])
 
         if self.calculator.records:
-            best_confidence = max(record.confidence for record in self.calculator.records)
-            self.confidence_var.set(f"{best_confidence:.2f}")
+            # Use average confidence across all records instead of best.
+            confidences = [float(record.confidence) for record in self.calculator.records if hasattr(record, 'confidence')]
+            if confidences:
+                avg_conf = sum(confidences) / len(confidences)
+                self.confidence_var.set(f"{avg_conf:.2f}")
+            else:
+                self.confidence_var.set("-")
         else:
             self.confidence_var.set("-")
         self.output_json = self.calculator.to_json()

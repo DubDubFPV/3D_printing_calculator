@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image
 import json
 
 
@@ -109,6 +109,7 @@ class SlicerExtractionResult:
     raw_text: str = ""
     confidence: float = 0.0  # 0-1 confidence in extraction
     slicer_detected: str = ""  # "IdeaMaker", "BambuStudio", "Unknown"
+    time_ambiguous: bool = False
     debug_info: Optional["ExtractionDebugInfo"] = None
     
     def to_dict(self) -> Dict[str, Any]:
@@ -242,6 +243,20 @@ class SlicerDataExtractor:
 
         if return_debug:
             result.debug_info = ExtractionDebugInfo(passes=ocr_passes, selected_pass_index=best_index)
+        # Detect ambiguous time selection: if some passes contain both "total time" and
+        # "model printing time" but the chosen result contains only "model printing time",
+        # mark time_ambiguous so the UI can prompt the user to re-capture.
+        try:
+            lower_texts = [p.text.lower() for p in ocr_passes]
+            has_total = any("total time" in t for t in lower_texts)
+            has_model = any("model printing time" in t for t in lower_texts)
+            chosen_text = (result.raw_text or "").lower()
+            if has_total and has_model and ("model printing time" in chosen_text) and ("total time" not in chosen_text):
+                result.time_ambiguous = True
+        except Exception:
+            result.time_ambiguous = False
+
+        if return_debug:
             return result
 
         return result
@@ -361,17 +376,17 @@ class SlicerDataExtractor:
                 return TimeData(hours=int(match.group(1)), minutes=int(match.group(2)), seconds=int(match.group(3)))
 
             # "3h41m46s"
-            match = re.search(r'(\d+)\s*h\s*(\d+)\s*m\s*(\d+)\s*s', value)
+            match = re.search(r'(\d+)\s*h\s*(\d+)\s*m\s*(\d+)\s*s(?![a-z])', value)
             if match:
                 return TimeData(hours=int(match.group(1)), minutes=int(match.group(2)), seconds=int(match.group(3)))
 
             # "3h41m"
-            match = re.search(r'(\d+)\s*h\s*(\d+)\s*m(?!\w)', value)
+            match = re.search(r'(\d+)\s*h\s*(\d+)\s*m(?![a-z])', value)
             if match:
                 return TimeData(hours=int(match.group(1)), minutes=int(match.group(2)), seconds=0)
 
             # "41m46s"
-            match = re.search(r'(\d+)\s*m\s*(\d+)\s*s(?!\w)', value)
+            match = re.search(r'(\d+)\s*m\s*(\d+)\s*s(?![a-z])', value)
             if match:
                 return TimeData(hours=0, minutes=int(match.group(1)), seconds=int(match.group(2)))
 
@@ -381,6 +396,22 @@ class SlicerDataExtractor:
                 return TimeData(hours=int(match.group(1)), minutes=int(match.group(2)), seconds=int(match.group(3)))
 
             return None
+
+        def time_line_score(line: str) -> int:
+            score = 0
+            if "total" in line and "time" in line:
+                score += 120
+            elif "model" in line and "printing" in line and "time" in line:
+                score += 70
+            elif "print" in line and "time" in line:
+                score += 60
+            elif "time" in line:
+                score += 50
+
+            if "prepare" in line or "timelapse" in line:
+                score -= 60
+
+            return score
 
         def next_time_value(index: int) -> Optional[TimeData]:
             for next_index in range(index + 1, min(index + 4, len(lines))):
@@ -401,19 +432,18 @@ class SlicerDataExtractor:
 
         # Extra BambuStudio heuristic: the "total time" value is often a later line
         # that OCR may not keep next to the label. If both total and model printing
-        # values appear in the OCR output, prefer the larger one.
+        # values appear in the OCR output, prefer the better labeled candidate.
         if any("model printing time" in line for line in lines) and any("total time" in line for line in lines):
-            candidates: List[TimeData] = []
+            candidates: List[tuple[int, TimeData]] = []
             for line in lines:
                 if "time" not in line:
                     continue
                 parsed = parse_time_expression(line)
                 if parsed and parsed.total_seconds > 0:
-                    candidates.append(parsed)
+                    candidates.append((time_line_score(line), parsed))
             if candidates:
-                # Total time should usually be the longest duration on the panel,
-                # but ignore obvious prep/timelapse fragments by the earlier penalty.
-                return max(candidates, key=lambda td: td.total_seconds)
+                # Prefer the explicit total label even if the model printing value is larger.
+                return max(candidates, key=lambda item: (item[0], item[1].total_seconds))[1]
 
         # Secondary: a "total" label often appears as just "total:" in OCR.
         for i, line in enumerate(lines):
@@ -424,20 +454,6 @@ class SlicerDataExtractor:
                 candidate = next_time_value(i)
                 if candidate:
                     return candidate
-
-        def line_score(line: str) -> int:
-            score = 0
-            if "model" in line and "printing" in line and "time" in line:
-                score += 70
-            elif "print" in line and "time" in line:
-                score += 60
-            elif "time" in line:
-                score += 50
-
-            if "prepare" in line or "timelapse" in line:
-                score -= 60
-
-            return score
 
         best_time: Optional[TimeData] = None
         best_score = -10**9
@@ -450,7 +466,7 @@ class SlicerDataExtractor:
             if not parsed or parsed.total_seconds <= 0:
                 continue
 
-            score = line_score(raw_line)
+            score = time_line_score(raw_line)
             if best_time is None or score > best_score or (score == best_score and parsed.total_seconds > best_time.total_seconds):
                 best_time = parsed
                 best_score = score
@@ -486,15 +502,6 @@ class SlicerDataExtractor:
             if value > 500 and not had_decimal:
                 score -= 3.0
 
-            if time_data is not None and time_data.total_seconds > 0:
-                grams_per_hour = value / (time_data.total_seconds / 3600.0)
-                if 0.5 <= grams_per_hour <= 250:
-                    score += 4.0
-                elif 250 < grams_per_hour <= 500:
-                    score += 1.0
-                else:
-                    score -= 4.0
-
             return score
 
         def normalized_grams_from_token(token: str) -> Optional[float]:
@@ -508,17 +515,38 @@ class SlicerDataExtractor:
             except ValueError:
                 return None
 
-            candidates = [raw_value]
+            candidates: List[tuple[float, float]] = [(raw_value, 0.0)]
+
+            # OCR often drops the decimal point in BambuStudio's small text.
+            # Prefer reconstructed decimals over the raw integer when a token
+            # has no explicit decimal separator.
+            if not had_decimal and slicer_type == "BambuStudio" and len(token) >= 3:
+                if token.startswith("0"):
+                    leading_zero_token = token.lstrip("0")
+                    leading_zero_candidate = parse_decimal("0." + leading_zero_token) if leading_zero_token else None
+                    if leading_zero_candidate is not None:
+                        candidates.append((leading_zero_candidate, 1.5))
+                else:
+                    compact_candidate = parse_decimal(f"{token[0]}.{token[1:]}")
+                    candidates.append((compact_candidate, 1.5))
+
+            # OCR often drops the decimal point in BambuStudio's small text,
+            # e.g. "057" can mean "0.57".
+            if not had_decimal and len(token) >= 3 and token.startswith("0"):
+                leading_zero_candidate = parse_decimal("0." + token.lstrip("0")) if token.lstrip("0") else None
+                if leading_zero_candidate is not None:
+                    candidates.append((leading_zero_candidate, 1.0))
             # OCR sometimes drops decimal points, e.g. "6.44" -> "644".
             # Only consider these fixes when the implied print rate is plausible.
             if not had_decimal and raw_value >= 100 and time_data is not None and time_data.total_seconds > 0:
-                candidates.append(raw_value / 10.0)
-                candidates.append(raw_value / 100.0)
+                candidates.append((raw_value / 10.0, 1.0))
+                candidates.append((raw_value / 100.0, 1.0))
+                candidates.append((raw_value / 1000.0, 1.0))
 
             best_value = None
             best_score = -10**9
-            for candidate in candidates:
-                candidate_score = score_grams_candidate(candidate, had_decimal)
+            for candidate, bonus in candidates:
+                candidate_score = score_grams_candidate(candidate, had_decimal) + bonus
                 if candidate_score > best_score:
                     best_score = candidate_score
                     best_value = candidate
@@ -528,50 +556,55 @@ class SlicerDataExtractor:
         def extract_kg_candidates(value: str) -> List[float]:
             return [parse_decimal(match) for match in re.findall(r'(\d+[\.,]?\d*)\s*kg\b', value)]
 
+        def has_gram_context(value: str) -> bool:
+            return re.search(r'\d+[\.,]?\d*\s*(?:g|q|9)\b', value) is not None
+
+        def line_has_meter_only_context(value: str) -> bool:
+            return re.search(r'\d+[\.,]?\d*\s*m\b', value) is not None and not has_gram_context(value)
+
         def extract_g_candidates(value: str) -> List[float]:
             candidates: List[float] = []
             for token in re.findall(r'(\d+[\.,]?\d*)\s*g\b', value):
-                try:
-                    # Skip meter-like values (> 100)
-                    raw = parse_decimal(token)
-                    if raw > 100:
-                        continue
-                except ValueError:
-                    pass
                 normalized = normalized_grams_from_token(token)
                 if normalized is not None:
                     candidates.append(normalized)
+
+            # BambuStudio sometimes renders the unit as a 9/Q-like shape; only use
+            # this fallback on Bambu screenshots and only when the line is gram-like.
+            if slicer_type == "BambuStudio":
+                for token in re.findall(r'(\d+[\.,]?\d*)\s*[q9]\b', value):
+                    normalized = normalized_grams_from_token(token)
+                    if normalized is not None:
+                        candidates.append(normalized)
             return candidates
 
         def rightmost_g_value(value: str) -> Optional[float]:
-            # Only accept explicit "g" tokens; reject meter values (usually > 100).
+            if slicer_type == "BambuStudio" and has_gram_context(value):
+                return extract_rightmost_numeric_token(value)
+
             matches = re.findall(r'(\d+[\.,]?\d*)\s*g\b', value)
             if not matches:
-                return None
-            # Try from rightmost, but skip likely meter values.
+                if slicer_type != "BambuStudio":
+                    return None
+                matches = re.findall(r'(\d+[\.,]?\d*)\s*[q9]\b', value)
+                if not matches:
+                    return None
+
             for token in reversed(matches):
-                try:
-                    candidate = parse_decimal(token)
-                except ValueError:
-                    continue
-                # Skip values that look like meter measurements (> 100 typically)
-                if candidate > 100:
-                    continue
-                return normalized_grams_from_token(token)
-            # If all rightmost values look like meters, try the smallest one.
-            return normalized_grams_from_token(matches[0])
+                normalized = normalized_grams_from_token(token)
+                if normalized is not None:
+                    return normalized
+            return None
 
         def extract_rightmost_numeric_token(value: str) -> Optional[float]:
+            # Don't use bare numbers from pure meter rows. Mixed Bambu rows like
+            # "7.54 m 22.85 g" are allowed because the grams context is present.
+            if line_has_meter_only_context(value):
+                return None
             tokens = re.findall(r'(\d+[\.,]?\d*)', value)
             if not tokens:
                 return None
-            try:
-                candidate = parse_decimal(tokens[-1])
-            except ValueError:
-                return None
-            if is_reasonable_grams(candidate):
-                return candidate
-            return None
+            return normalized_grams_from_token(tokens[-1])
 
         def row_matches_total(line: str) -> bool:
             return "total" in line and "price" not in line and "cost" not in line
@@ -705,22 +738,39 @@ class SlicerDataExtractor:
     
     def _calculate_confidence(self, raw_text: str, time_data: TimeData, filament_data: FilamentData) -> float:
         """
-        Calculate confidence score for the extraction (0-1)
-        Both time and filament found = 1.0
-        Only one found = 0.5
-        Neither found = 0.0
+        Calculate a graded confidence score (0.0-1.0) using several
+        heuristics so the GUI can present a more informative value.
         """
-        confidence = 0.0
-        
-        # Time found
+        text = (raw_text or "").lower()
+        score = 0.0
+
+        # Time component (0.0 - 0.5)
         if time_data.total_seconds > 0:
-            confidence += 0.5
-        
-        # Filament found
+            score += 0.35
+            # prefer explicit "total time" label
+            if "total time" in text:
+                score += 0.10
+            # penalize if only "model printing time" appears
+            if "model printing time" in text and "total time" not in text:
+                score -= 0.10
+
+        # Filament component (0.0 - 0.45)
         if filament_data.amount > 0:
-            confidence += 0.5
-        
-        return confidence
+            score += 0.25
+            # decimals in grams are more reliable (e.g., 5.89 g)
+            if re.search(r'\d+[\.,]\d+\s*g\b', text):
+                score += 0.10
+            # explicit unit presence increases confidence
+            if re.search(r'\d+[\.,]?\d*\s*g\b', text):
+                score += 0.05
+
+        # Small bonus for kg clarity
+        if filament_data.unit and filament_data.unit.lower() == "kg":
+            score += 0.05
+
+        # Clamp and normalize to 0..1
+        score = max(0.0, min(1.0, score))
+        return score
 
 
 # ============================================================================
