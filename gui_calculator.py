@@ -164,6 +164,7 @@ class SlicerCalculatorApp(tk.Tk):
         self._row_counter = 0
         self._next_manual_name_index = 1
         self.naming_mode_button: Optional[ttk.Button] = None
+        self.spool_planner_button: Optional[ttk.Button] = None
         self.debug_enabled = os.environ.get("SLICER_DEBUG", "0") == "1"
         self.debug_window = None
 
@@ -255,6 +256,8 @@ class SlicerCalculatorApp(tk.Tk):
         ttk.Button(button_row, text="Delete Selected", style="Action.TButton", command=self._delete_selected_job).pack(fill="x", pady=(8, 0))
         ttk.Button(button_row, text="Delete All", style="Action.TButton", command=self._clear_jobs).pack(fill="x", pady=(8, 0))
         ttk.Button(button_row, text="Export JSON", style="Action.TButton", command=self._copy_json).pack(fill="x", pady=(8, 0))
+        self.spool_planner_button = ttk.Button(button_row, text="Plan Spool Usage", style="Accent.TButton", command=self._open_spool_planner_dialog)
+        self.spool_planner_button.pack(fill="x", pady=(8, 0))
 
     def _build_results_panel(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Jobs", style="Section.TLabel").pack(anchor="w")
@@ -599,6 +602,249 @@ class SlicerCalculatorApp(tk.Tk):
         self.clipboard_append(payload)
         self.status_var.set("JSON copied to clipboard.")
 
+    def _eligible_spool_records(self) -> List[JobRecord]:
+        return [
+            record
+            for record in self.calculator.records
+            if record.total_seconds > 0 and record.filament_grams > 0
+        ]
+
+    def _update_spool_planner_state(self) -> None:
+        if self.spool_planner_button is None:
+            return
+
+        eligible_count = len(self._eligible_spool_records())
+        if eligible_count >= 2:
+            self.spool_planner_button.state(["!disabled"])
+        else:
+            self.spool_planner_button.state(["disabled"])
+
+    def _open_spool_planner_dialog(self) -> None:
+        eligible_records = self._eligible_spool_records()
+        if len(eligible_records) < 2:
+            messagebox.showinfo(
+                "Not enough jobs",
+                "Add at least 2 screenshots with non-zero time and filament before planning a spool.",
+            )
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Spool Planner")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        mode_var = tk.StringVar(value="direct")
+        amount_var = tk.StringVar(value="")
+        amount_unit_var = tk.StringVar(value="g")
+        spool_size_var = tk.StringVar(value="")
+        spool_unit_var = tk.StringVar(value="g")
+        spool_count_var = tk.StringVar(value="1")
+
+        root = ttk.Frame(dialog, padding=16)
+        root.pack(fill="both", expand=True)
+
+        ttk.Label(root, text="Available Filament", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(
+            root,
+            text="Use a 5% safety margin. The planner will fit the best screenshot subset inside 95% of the available filament.",
+            style="Subtitle.TLabel",
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 10))
+
+        radio_frame = ttk.Frame(root)
+        radio_frame.pack(fill="x", pady=(0, 8))
+        ttk.Radiobutton(radio_frame, text="Enter total available amount", variable=mode_var, value="direct").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(radio_frame, text="Enter spool size and count", variable=mode_var, value="spools").grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        direct_frame = ttk.LabelFrame(root, text="Total available", padding=10)
+        direct_frame.pack(fill="x", pady=(8, 8))
+        ttk.Entry(direct_frame, textvariable=amount_var, width=12).grid(row=0, column=0, sticky="w")
+        ttk.Combobox(direct_frame, textvariable=amount_unit_var, values=("g", "kg"), width=5, state="readonly").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(direct_frame, text="Example: 1000 g or 1 kg", style="Field.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        spool_frame = ttk.LabelFrame(root, text="Spool size x count", padding=10)
+        spool_frame.pack(fill="x", pady=(0, 8))
+        ttk.Entry(spool_frame, textvariable=spool_size_var, width=12).grid(row=0, column=0, sticky="w")
+        ttk.Combobox(spool_frame, textvariable=spool_unit_var, values=("g", "kg"), width=5, state="readonly").grid(row=0, column=1, sticky="w", padx=(8, 8))
+        ttk.Label(spool_frame, text="x", style="Field.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Entry(spool_frame, textvariable=spool_count_var, width=8).grid(row=0, column=3, sticky="w", padx=(8, 0))
+        ttk.Label(spool_frame, text="Example: 750 g x 2", style="Field.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        button_bar = ttk.Frame(root)
+        button_bar.pack(fill="x", pady=(8, 0))
+
+        def parse_float(value: str, label: str) -> float:
+            try:
+                return float(value.strip())
+            except Exception:
+                raise ValueError(f"Enter a valid number for {label}.")
+
+        def resolve_available_grams() -> float:
+            if mode_var.get() == "direct":
+                amount = parse_float(amount_var.get(), "available amount")
+                if amount <= 0:
+                    raise ValueError("Available filament must be greater than zero.")
+                if amount_unit_var.get() == "kg":
+                    return amount * 1000.0
+                return amount
+
+            spool_size = parse_float(spool_size_var.get(), "spool size")
+            spool_count = parse_float(spool_count_var.get(), "spool count")
+            if spool_size <= 0 or spool_count <= 0:
+                raise ValueError("Spool size and spool count must both be greater than zero.")
+            if spool_unit_var.get() == "kg":
+                spool_size *= 1000.0
+            return spool_size * spool_count
+
+        def on_plan() -> None:
+            try:
+                available_grams = resolve_available_grams()
+            except ValueError as exc:
+                messagebox.showerror("Invalid input", str(exc), parent=dialog)
+                return
+
+            plan = self._calculate_spool_plan(eligible_records, available_grams, safety_margin=0.05)
+            dialog.destroy()
+            self._show_spool_plan_result(plan)
+
+        ttk.Button(button_bar, text="Plan", style="Accent.TButton", command=on_plan).pack(side="left")
+        ttk.Button(button_bar, text="Cancel", style="Action.TButton", command=dialog.destroy).pack(side="left", padx=(8, 0))
+
+    def _calculate_spool_plan(self, records: List[JobRecord], available_grams: float, safety_margin: float = 0.05) -> Dict[str, Any]:
+        usable_grams = available_grams / (1.0 + safety_margin)
+        scale = 10
+        capacity = max(0, int(round(usable_grams * scale)))
+
+        filtered_records: List[tuple[int, JobRecord, int]] = []
+        for index, record in enumerate(records):
+            weight = int(round(record.filament_grams * scale))
+            if weight > 0:
+                filtered_records.append((index, record, weight))
+
+        if not filtered_records:
+            return {
+                "available_grams": available_grams,
+                "usable_grams": usable_grams,
+                "capacity": capacity,
+                "selected_indices": [],
+                "selected_records": [],
+                "selected_total_grams": 0.0,
+                "all_total_grams": 0.0,
+                "fits_all": False,
+                "remaining_records": [],
+            }
+
+        best_paths: Dict[int, List[int]] = {0: []}
+        for index, _record, weight in filtered_records:
+            current_paths = list(best_paths.items())
+            for total_scaled, chosen_indices in current_paths:
+                new_total = total_scaled + weight
+                if new_total > capacity or new_total in best_paths:
+                    continue
+                best_paths[new_total] = chosen_indices + [index]
+
+        best_total_scaled = max(best_paths)
+        selected_indices = best_paths[best_total_scaled]
+        selected_records = [records[index] for index in selected_indices]
+        selected_total_grams = sum(record.filament_grams for record in selected_records)
+        all_total_grams = sum(record.filament_grams for record in records)
+        fits_all = all_total_grams <= usable_grams
+
+        remaining_records = [record for index, record in enumerate(records) if index not in set(selected_indices)]
+
+        return {
+            "available_grams": available_grams,
+            "usable_grams": usable_grams,
+            "capacity": capacity,
+            "selected_indices": selected_indices,
+            "selected_records": selected_records,
+            "selected_total_grams": selected_total_grams,
+            "all_total_grams": all_total_grams,
+            "fits_all": fits_all,
+            "remaining_records": remaining_records,
+            "safety_margin": safety_margin,
+        }
+
+    def _show_spool_plan_result(self, plan: Dict[str, Any]) -> None:
+        window = tk.Toplevel(self)
+        window.title("Spool Plan Result")
+        window.geometry("820x620")
+        window.minsize(760, 520)
+
+        root = ttk.Frame(window, padding=16)
+        root.pack(fill="both", expand=True)
+
+        header = ttk.Frame(root)
+        header.pack(fill="x")
+        ttk.Label(header, text="Spool Plan Result", style="Section.TLabel").pack(anchor="w")
+
+        summary = ttk.Frame(root)
+        summary.pack(fill="x", pady=(10, 0))
+
+        available_grams = float(plan["available_grams"])
+        usable_grams = float(plan["usable_grams"])
+        selected_total_grams = float(plan["selected_total_grams"])
+        all_total_grams = float(plan["all_total_grams"])
+        fits_all = bool(plan["fits_all"])
+
+        rows = [
+            ("Available filament", PrintJobCalculator.format_filament(available_grams)),
+            ("Usable with 5% margin", PrintJobCalculator.format_filament(usable_grams)),
+            ("Best subset total", PrintJobCalculator.format_filament(selected_total_grams)),
+            ("All jobs total", PrintJobCalculator.format_filament(all_total_grams)),
+            ("All jobs fit", "Yes" if fits_all else "No"),
+        ]
+
+        for row_index, (label, value) in enumerate(rows):
+            ttk.Label(summary, text=label, style="Field.TLabel").grid(row=row_index, column=0, sticky="w", padx=(0, 16), pady=2)
+            ttk.Label(summary, text=value, style="Value.TLabel").grid(row=row_index, column=1, sticky="w", pady=2)
+
+        body = ttk.Frame(root)
+        body.pack(fill="both", expand=True, pady=(14, 0))
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        ttk.Label(body, text="Selected jobs", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, text="Skipped jobs", style="Section.TLabel").grid(row=0, column=1, sticky="w")
+
+        selected_text = tk.Text(body, height=14, wrap="word", bg="#111722", fg="#e7edf5", insertbackground="#e7edf5", relief="flat")
+        skipped_text = tk.Text(body, height=14, wrap="word", bg="#111722", fg="#e7edf5", insertbackground="#e7edf5", relief="flat")
+        selected_text.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(8, 0))
+        skipped_text.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(8, 0))
+
+        selected_records: List[JobRecord] = list(plan["selected_records"])
+        remaining_records: List[JobRecord] = list(plan["remaining_records"])
+
+        if selected_records:
+            selected_text.insert(tk.END, "Use these screenshots on the same spool:\n\n")
+            for record in selected_records:
+                selected_text.insert(
+                    tk.END,
+                    f"- {record.file_path}\n  Time: {self.calculator.format_time(record.total_seconds)}\n  Filament: {PrintJobCalculator.format_filament(record.filament_grams)}\n\n",
+                )
+        else:
+            selected_text.insert(tk.END, "No valid subset could be planned from the uploaded screenshots.")
+
+        if remaining_records:
+            skipped_text.insert(tk.END, "Other screenshots not included in the best-fit spool:\n\n")
+            for record in remaining_records:
+                skipped_text.insert(
+                    tk.END,
+                    f"- {record.file_path}\n  Time: {self.calculator.format_time(record.total_seconds)}\n  Filament: {PrintJobCalculator.format_filament(record.filament_grams)}\n\n",
+                )
+        else:
+            skipped_text.insert(tk.END, "Nothing was skipped.")
+
+        selected_text.configure(state="disabled")
+        skipped_text.configure(state="disabled")
+
+        button_bar = ttk.Frame(root)
+        button_bar.pack(fill="x", pady=(12, 0))
+        ttk.Button(button_bar, text="Close", style="Action.TButton", command=window.destroy).pack(side="right")
+
     def _refresh_after_change(self) -> None:
         totals = self.calculator.totals()
         self.job_count_var.set(str(totals["job_count"]))
@@ -616,6 +862,7 @@ class SlicerCalculatorApp(tk.Tk):
         else:
             self.confidence_var.set("-")
         self.output_json = self.calculator.to_json()
+        self._update_spool_planner_state()
 
 
 def main() -> None:
